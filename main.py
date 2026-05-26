@@ -7,7 +7,7 @@ from typing import Optional, List
 
 import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -156,6 +156,48 @@ class StoredFile(Base):
     project = relationship("Project")
 
 
+class ShareLink(Base):
+    __tablename__ = "share_links"
+
+    id = Column(Integer, primary_key=True, index=True)
+    file_id = Column(Integer, ForeignKey("files.id"), nullable=False)
+    token = Column(String, unique=True, nullable=False)
+    client_name = Column(String, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    assigned_staff_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+    status = Column(String, default="ACTIVE")  # ACTIVE, EXPIRED, REVOKED
+    note = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    file = relationship("StoredFile", foreign_keys=[file_id])
+    creator = relationship("User", foreign_keys=[created_by])
+    assigned_staff = relationship("User", foreign_keys=[assigned_staff_user_id])
+
+
+class AuditLog(Base):
+    __tablename__ = "access_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    file_id = Column(Integer, ForeignKey("files.id"), nullable=False)
+    share_link_id = Column(Integer, ForeignKey("share_links.id"), nullable=True)
+    action = Column(String, nullable=False)
+    actor_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    actor_type = Column(String, nullable=False)  # INTERNAL_USER, CUSTOMER
+    ip_address = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    message = Column(String, nullable=True)
+    result = Column(String, default="SUCCESS")  # SUCCESS, DENIED
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    file = relationship("StoredFile", foreign_keys=[file_id])
+    share_link = relationship("ShareLink", foreign_keys=[share_link_id])
+    actor_user = relationship("User", foreign_keys=[actor_user_id])
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -171,6 +213,17 @@ class ProjectCreateRequest(BaseModel):
     clientName: str
     description: Optional[str] = None
     members: Optional[List[ProjectMemberInput]] = []
+
+
+class ProjectStaffUpdateRequest(BaseModel):
+    staffUserIds: List[int]
+
+
+class ShareLinkCreateRequest(BaseModel):
+    clientName: str
+    expiresInDays: int
+    assignedStaffUserId: Optional[int] = None
+    note: Optional[str] = None
 
 
 def get_db():
@@ -276,6 +329,79 @@ def validate_project_role(project_role: str):
 def require_manager_or_executive(user: User):
     if user.role not in ["MANAGER", "EXECUTIVE"]:
         raise HTTPException(status_code=403, detail="팀장 또는 임원 권한이 필요합니다.")
+
+
+def validate_share_link_expiry_days(expires_in_days: int):
+    allowed = [1, 3, 7]
+    if expires_in_days not in allowed:
+        raise HTTPException(status_code=400, detail=f"expiresInDays는 {allowed} 중 하나여야 합니다.")
+
+
+def is_project_staff_assignee(db: Session, project_id: int, user_id: int) -> bool:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or user.role != "EMPLOYEE":
+        return False
+
+    member = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id,
+        ProjectMember.user_id == user_id,
+        ProjectMember.project_role == "MEMBER"
+    ).first()
+    return member is not None
+
+
+def get_client_ip(request: Request) -> Optional[str]:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return None
+
+
+def write_audit_log(
+    db: Session,
+    file_id: int,
+    action: str,
+    request: Request,
+    actor_user_id: Optional[int] = None,
+    actor_type: str = "INTERNAL_USER",
+    share_link_id: Optional[int] = None,
+    message: Optional[str] = None,
+    result: str = "SUCCESS",
+):
+    log = AuditLog(
+        file_id=file_id,
+        share_link_id=share_link_id,
+        action=action,
+        actor_user_id=actor_user_id,
+        actor_type=actor_type,
+        ip_address=get_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        message=message,
+        result=result,
+    )
+    db.add(log)
+    db.commit()
+
+
+def get_active_share_link(db: Session, token: str) -> ShareLink:
+    share_link = db.query(ShareLink).filter(ShareLink.token == token).first()
+    if not share_link:
+        raise HTTPException(status_code=404, detail="공유 링크를 찾을 수 없습니다.")
+
+    if share_link.status == "REVOKED":
+        raise HTTPException(status_code=410, detail="비활성화된 공유 링크입니다.")
+
+    now = datetime.utcnow()
+    if share_link.expires_at < now:
+        if share_link.status != "EXPIRED":
+            share_link.status = "EXPIRED"
+            share_link.updated_at = now
+            db.commit()
+        raise HTTPException(status_code=410, detail="만료된 공유 링크입니다.")
+
+    return share_link
 
 
 def startup():
@@ -560,6 +686,125 @@ def get_project_detail(
     }
 
 
+@app.get("/api/projects/{project_id}/staff-assignees")
+def get_project_staff_assignees(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    require_manager_or_executive(current_user)
+
+    if not is_project_member(db, current_user.id, project_id):
+        raise HTTPException(status_code=403, detail="프로젝트 접근 권한이 없습니다.")
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    assignee_members = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id,
+        ProjectMember.project_role == "MEMBER"
+    ).all()
+
+    return {
+        "projectId": project_id,
+        "staffAssignees": [
+            {
+                "userId": member.user.id,
+                "name": member.user.name,
+                "email": member.user.email
+            }
+            for member in assignee_members
+            if member.user and member.user.role == "EMPLOYEE"
+        ]
+    }
+
+
+@app.put("/api/projects/{project_id}/staff-assignees")
+def update_project_staff_assignees(
+    project_id: int,
+    payload: ProjectStaffUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    require_manager_or_executive(current_user)
+
+    if not is_project_member(db, current_user.id, project_id):
+        raise HTTPException(status_code=403, detail="프로젝트 접근 권한이 없습니다.")
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    unique_user_ids = list(dict.fromkeys(payload.staffUserIds))
+    if unique_user_ids:
+        users = db.query(User).filter(User.id.in_(unique_user_ids)).all()
+        user_map = {user.id: user for user in users}
+
+        invalid_user_ids = [user_id for user_id in unique_user_ids if user_id not in user_map]
+        if invalid_user_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"존재하지 않는 사용자 ID가 포함되어 있습니다: {invalid_user_ids}"
+            )
+
+        non_employee_ids = [
+            user_id for user_id in unique_user_ids
+            if user_map[user_id].role != "EMPLOYEE"
+        ]
+        if non_employee_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"담당 직원은 EMPLOYEE만 지정할 수 있습니다: {non_employee_ids}"
+            )
+
+        not_member_ids = [
+            user_id for user_id in unique_user_ids
+            if not is_project_member(db, user_id, project_id)
+        ]
+        if not_member_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"프로젝트 참여자가 아닌 사용자가 포함되어 있습니다: {not_member_ids}"
+            )
+
+    employee_members = db.query(ProjectMember).join(User, ProjectMember.user_id == User.id).filter(
+        ProjectMember.project_id == project_id,
+        User.role == "EMPLOYEE"
+    ).all()
+
+    for member in employee_members:
+        member.project_role = "VIEWER"
+
+    selected_set = set(unique_user_ids)
+    selected_members = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id,
+        ProjectMember.user_id.in_(selected_set)
+    ).all()
+    for member in selected_members:
+        member.project_role = "MEMBER"
+
+    db.commit()
+
+    saved_members = db.query(ProjectMember).join(User, ProjectMember.user_id == User.id).filter(
+        ProjectMember.project_id == project_id,
+        ProjectMember.project_role == "MEMBER",
+        User.role == "EMPLOYEE"
+    ).all()
+
+    return {
+        "projectId": project_id,
+        "staffAssignees": [
+            {
+                "userId": member.user.id,
+                "name": member.user.name,
+                "email": member.user.email
+            }
+            for member in saved_members
+        ]
+    }
+
+
 @app.post("/api/projects/{project_id}/files", status_code=201)
 def upload_file(
     project_id: int,
@@ -618,6 +863,135 @@ def upload_file(
     }
 
 
+@app.post("/api/files/{file_id}/share-links", status_code=201)
+def create_share_link(
+    file_id: int,
+    payload: ShareLinkCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    require_manager_or_executive(current_user)
+    validate_share_link_expiry_days(payload.expiresInDays)
+
+    file_record = db.query(StoredFile).filter(
+        StoredFile.id == file_id,
+        StoredFile.status == "ACTIVE"
+    ).first()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    if not is_project_member(db, current_user.id, file_record.project_id):
+        raise HTTPException(status_code=403, detail="프로젝트 접근 권한이 없습니다.")
+
+    if not payload.clientName.strip():
+        raise HTTPException(status_code=400, detail="고객사명은 필수입니다.")
+
+    assigned_staff_user_id = payload.assignedStaffUserId
+    if assigned_staff_user_id is not None:
+        staff_user = db.query(User).filter(User.id == assigned_staff_user_id).first()
+        if not staff_user:
+            raise HTTPException(status_code=400, detail="지정한 담당 직원을 찾을 수 없습니다.")
+        if staff_user.role != "EMPLOYEE":
+            raise HTTPException(status_code=400, detail="담당 직원은 EMPLOYEE만 지정할 수 있습니다.")
+        if not is_project_staff_assignee(db, file_record.project_id, assigned_staff_user_id):
+            raise HTTPException(status_code=400, detail="지정한 사용자는 프로젝트 담당 직원이 아닙니다.")
+
+    token = uuid.uuid4().hex
+    expires_at = datetime.utcnow() + timedelta(days=payload.expiresInDays)
+    share_link = ShareLink(
+        file_id=file_id,
+        token=token,
+        client_name=payload.clientName.strip(),
+        created_by=current_user.id,
+        assigned_staff_user_id=assigned_staff_user_id,
+        expires_at=expires_at,
+        status="ACTIVE",
+        note=payload.note
+    )
+
+    db.add(share_link)
+    db.commit()
+    db.refresh(share_link)
+
+    base_url = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
+    share_url = f"{base_url}/api/share-links/{share_link.token}"
+
+    return {
+        "shareLinkId": share_link.id,
+        "fileId": share_link.file_id,
+        "token": share_link.token,
+        "url": share_url,
+        "clientName": share_link.client_name,
+        "createdBy": share_link.created_by,
+        "assignedStaffUserId": share_link.assigned_staff_user_id,
+        "expiresAt": share_link.expires_at,
+        "status": share_link.status,
+        "note": share_link.note
+    }
+
+
+@app.get("/api/share-links/{token}")
+def get_share_link(token: str, request: Request, db: Session = Depends(get_db)):
+    share_link = get_active_share_link(db, token)
+    file_record = db.query(StoredFile).filter(
+        StoredFile.id == share_link.file_id,
+        StoredFile.status == "ACTIVE"
+    ).first()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="공유 대상 파일을 찾을 수 없습니다.")
+
+    write_audit_log(
+        db=db,
+        file_id=file_record.id,
+        share_link_id=share_link.id,
+        action="SHARE_LINK_VIEW",
+        actor_type="CUSTOMER",
+        request=request,
+    )
+
+    return {
+        "shareLinkId": share_link.id,
+        "fileId": file_record.id,
+        "projectId": file_record.project_id,
+        "originalFilename": file_record.original_filename,
+        "fileSize": file_record.file_size,
+        "mimeType": file_record.mime_type,
+        "fileType": file_record.file_type,
+        "clientName": share_link.client_name,
+        "expiresAt": share_link.expires_at,
+        "status": share_link.status
+    }
+
+
+@app.get("/api/share-links/{token}/download")
+def download_share_link_file(token: str, request: Request, db: Session = Depends(get_db)):
+    share_link = get_active_share_link(db, token)
+    file_record = db.query(StoredFile).filter(
+        StoredFile.id == share_link.file_id,
+        StoredFile.status == "ACTIVE"
+    ).first()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="공유 대상 파일을 찾을 수 없습니다.")
+
+    if not os.path.exists(file_record.storage_path):
+        raise HTTPException(status_code=404, detail="저장된 파일을 찾을 수 없습니다.")
+
+    write_audit_log(
+        db=db,
+        file_id=file_record.id,
+        share_link_id=share_link.id,
+        action="SHARE_LINK_DOWNLOAD",
+        actor_type="CUSTOMER",
+        request=request,
+    )
+
+    return FileResponse(
+        path=file_record.storage_path,
+        filename=file_record.original_filename,
+        media_type=file_record.mime_type
+    )
+
+
 @app.get("/api/projects/{project_id}/files")
 def get_project_files(
     project_id: int,
@@ -669,6 +1043,7 @@ def get_project_files(
 @app.get("/api/files/{file_id}")
 def get_file_detail(
     file_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -685,6 +1060,15 @@ def get_file_detail(
 
     if not can_access_file(current_user.role, file_record.file_type):
         raise HTTPException(status_code=403, detail="파일 접근 권한이 없습니다.")
+
+    write_audit_log(
+        db=db,
+        file_id=file_record.id,
+        action="INTERNAL_FILE_VIEW",
+        actor_user_id=current_user.id,
+        actor_type="INTERNAL_USER",
+        request=request,
+    )
 
     return {
         "fileId": file_record.id,
@@ -703,6 +1087,7 @@ def get_file_detail(
 @app.get("/api/files/{file_id}/download")
 def download_file(
     file_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -723,8 +1108,57 @@ def download_file(
     if not os.path.exists(file_record.storage_path):
         raise HTTPException(status_code=404, detail="저장된 파일을 찾을 수 없습니다.")
 
+    write_audit_log(
+        db=db,
+        file_id=file_record.id,
+        action="INTERNAL_FILE_DOWNLOAD",
+        actor_user_id=current_user.id,
+        actor_type="INTERNAL_USER",
+        request=request,
+    )
+
     return FileResponse(
         path=file_record.storage_path,
         filename=file_record.original_filename,
         media_type=file_record.mime_type
     )
+
+
+@app.get("/api/files/{file_id}/logs")
+def get_file_access_logs(
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    require_manager_or_executive(current_user)
+
+    file_record = db.query(StoredFile).filter(StoredFile.id == file_id).first()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    if not is_project_member(db, current_user.id, file_record.project_id):
+        raise HTTPException(status_code=403, detail="프로젝트 접근 권한이 없습니다.")
+
+    logs = db.query(AuditLog).filter(
+        AuditLog.file_id == file_id
+    ).order_by(AuditLog.created_at.desc()).all()
+
+    return {
+        "fileId": file_id,
+        "logs": [
+            {
+                "logId": log.id,
+                "action": log.action,
+                "actorUserId": log.actor_user_id,
+                "actorType": log.actor_type,
+                "shareLinkId": log.share_link_id,
+                "ipAddress": log.ip_address,
+                "userAgent": log.user_agent,
+                "message": log.message,
+                "result": log.result,
+                "createdAt": log.created_at
+            }
+            for log in logs
+        ],
+        "totalCount": len(logs)
+    }
