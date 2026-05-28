@@ -211,7 +211,7 @@ class AuditLog(Base):
     ip_address = Column(String, nullable=True)
     user_agent = Column(String, nullable=True)
     message = Column(String, nullable=True)
-    result = Column(String, default="SUCCESS")  # SUCCESS, DENIED
+    result = Column(String, default="SUCCESS")  # SUCCESS, FAILED
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -1099,7 +1099,7 @@ def get_share_link(token: str, request: Request, db: Session = Depends(get_db)):
         db=db,
         file_id=file_record.id,
         share_link_id=share_link.id,
-        action="SHARE_LINK_VIEW",
+        action="VIEW_SHARE_LINK",
         actor_type="CUSTOMER",
         request=request,
     )
@@ -1138,7 +1138,7 @@ def download_share_link_file(token: str, request: Request, db: Session = Depends
         db=db,
         file_id=file_record.id,
         share_link_id=share_link.id,
-        action="SHARE_LINK_DOWNLOAD",
+        action="DOWNLOAD_SHARE_LINK",
         actor_type="CUSTOMER",
         request=request,
     )
@@ -1222,7 +1222,7 @@ def get_file_detail(
     write_audit_log(
         db=db,
         file_id=file_record.id,
-        action="INTERNAL_FILE_VIEW",
+        action="VIEW_FILE",
         actor_user_id=current_user.id,
         actor_type="INTERNAL_USER",
         request=request,
@@ -1269,7 +1269,7 @@ def download_file(
     write_audit_log(
         db=db,
         file_id=file_record.id,
-        action="INTERNAL_FILE_DOWNLOAD",
+        action="DOWNLOAD_FILE",
         actor_user_id=current_user.id,
         actor_type="INTERNAL_USER",
         request=request,

@@ -25,20 +25,6 @@ def _columns(table_name: str) -> set[str]:
 
 def upgrade() -> None:
     """Add columns expected by main.py without changing API logic."""
-    op.execute(
-        "ALTER TYPE access_action ADD VALUE IF NOT EXISTS 'INTERNAL_FILE_VIEW'"
-    )
-    op.execute(
-        "ALTER TYPE access_action ADD VALUE IF NOT EXISTS 'INTERNAL_FILE_DOWNLOAD'"
-    )
-    op.execute(
-        "ALTER TYPE access_action ADD VALUE IF NOT EXISTS 'SHARE_LINK_VIEW'"
-    )
-    op.execute(
-        "ALTER TYPE access_action ADD VALUE IF NOT EXISTS 'SHARE_LINK_DOWNLOAD'"
-    )
-    op.execute("ALTER TYPE access_result ADD VALUE IF NOT EXISTS 'DENIED'")
-
     user_columns = _columns("users")
     if "password" not in user_columns:
         op.add_column("users", sa.Column("password", sa.String(length=255), nullable=True))
