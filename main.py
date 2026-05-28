@@ -306,7 +306,7 @@ class ProjectStaffUpdateRequest(BaseModel):
     )
 
     staffUserIds: List[int] = Field(
-        description="공유 링크 담당자로 지정할 EMPLOYEE 사용자 ID 목록",
+        description="프로젝트 담당 직원으로 지정할 EMPLOYEE 사용자 ID 목록",
         examples=[[1]],
     )
 
@@ -317,13 +317,11 @@ class ShareLinkCreateRequest(BaseModel):
             "example": {
                 "clientId": 1,
                 "expiresInDays": 7,
-                "assignedStaffUserId": 1,
             },
             "examples": [
                 {
                     "clientId": 1,
                     "expiresInDays": 7,
-                    "assignedStaffUserId": 1,
                 }
             ]
         }
@@ -333,11 +331,6 @@ class ShareLinkCreateRequest(BaseModel):
     expiresInDays: Literal[1, 3, 7] = Field(
         description="공유 링크 만료 기간. 1, 3, 7일만 허용됩니다.",
         examples=[7],
-    )
-    assignedStaffUserId: Optional[int] = Field(
-        default=None,
-        description="공유 링크 담당 직원 ID. 지정하지 않으면 null입니다.",
-        examples=[1],
     )
 
 
@@ -1040,16 +1033,6 @@ def create_share_link(
         if file_record.project.client_id != client.id:
             raise HTTPException(status_code=400, detail="파일의 프로젝트 고객사와 clientId가 일치하지 않습니다.")
 
-    assigned_staff_user_id = payload.assignedStaffUserId
-    if assigned_staff_user_id is not None:
-        staff_user = db.query(User).filter(User.id == assigned_staff_user_id).first()
-        if not staff_user:
-            raise HTTPException(status_code=400, detail="지정한 담당 직원을 찾을 수 없습니다.")
-        if staff_user.role != "EMPLOYEE":
-            raise HTTPException(status_code=400, detail="담당 직원은 EMPLOYEE만 지정할 수 있습니다.")
-        if not is_project_staff_assignee(db, file_record.project_id, assigned_staff_user_id):
-            raise HTTPException(status_code=400, detail="지정한 사용자는 프로젝트 담당 직원이 아닙니다.")
-
     token = uuid.uuid4().hex
     expires_at = datetime.utcnow() + timedelta(days=payload.expiresInDays)
     share_link = ShareLink(
@@ -1058,7 +1041,6 @@ def create_share_link(
         client_id=client.id,
         client_name=client.name,
         created_by=current_user.id,
-        assigned_staff_user_id=assigned_staff_user_id,
         expires_at=expires_at,
         status="ACTIVE"
     )
@@ -1079,7 +1061,6 @@ def create_share_link(
         "clientId": share_link.client_id,
         "clientName": share_link.client_name,
         "createdBy": share_link.created_by,
-        "assignedStaffUserId": share_link.assigned_staff_user_id,
         "expiresAt": share_link.expires_at,
         "status": share_link.status
     }
@@ -1115,7 +1096,6 @@ def get_share_link(token: str, request: Request, db: Session = Depends(get_db)):
         "clientId": share_link.client_id,
         "clientName": share_link.client_name,
         "createdBy": share_link.created_by,
-        "assignedStaffUserId": share_link.assigned_staff_user_id,
         "expiresAt": share_link.expires_at,
         "status": share_link.status
     }
