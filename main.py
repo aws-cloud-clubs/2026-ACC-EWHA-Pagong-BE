@@ -3,7 +3,7 @@ import uuid
 import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 import jwt
 from dotenv import load_dotenv
@@ -11,7 +11,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Req
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
     create_engine,
     Column,
@@ -83,14 +83,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3000/",
-        "http://localhost:3001",
-        "http://localhost:3001/",
-        "https://pagong-fe.vercel.app",
-        "https://pagong-fe.vercel.app/",
-    ],
+    allow_origin_regex=".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -215,31 +208,107 @@ class AuditLog(Base):
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "email": "employee@pagong.test",
+                    "password": "pagong1234",
+                }
+            ]
+        }
+    )
+
+    email: str = Field(description="로그인 이메일", examples=["employee@pagong.test"])
+    password: str = Field(description="로그인 비밀번호", examples=["pagong1234"])
 
 
 class ProjectMemberInput(BaseModel):
-    userId: int
-    projectRole: str  # MEMBER, VIEWER
+    userId: int = Field(description="프로젝트에 추가할 사용자 ID", examples=[1])
+    projectRole: Literal["MEMBER", "VIEWER"] = Field(
+        description="프로젝트 내 권한. LEADER는 생성자가 자동 지정됩니다.",
+        examples=["MEMBER"],
+    )
 
 
 class ProjectCreateRequest(BaseModel):
-    name: str
-    clientName: str
-    description: Optional[str] = None
-    members: Optional[List[ProjectMemberInput]] = []
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "name": "A뷰티 여름 캠페인",
+                    "clientName": "A뷰티",
+                    "description": "여름 신제품 런칭 캠페인",
+                    "members": [
+                        {
+                            "userId": 1,
+                            "projectRole": "MEMBER",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    name: str = Field(description="프로젝트명", examples=["A뷰티 여름 캠페인"])
+    clientName: str = Field(description="고객사명", examples=["A뷰티"])
+    description: Optional[str] = Field(
+        default=None,
+        description="프로젝트 설명",
+        examples=["여름 신제품 런칭 캠페인"],
+    )
+    members: List[ProjectMemberInput] = Field(
+        default_factory=list,
+        description="프로젝트에 함께 추가할 멤버 목록",
+    )
 
 
 class ProjectStaffUpdateRequest(BaseModel):
-    staffUserIds: List[int]
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "staffUserIds": [1],
+                }
+            ]
+        }
+    )
+
+    staffUserIds: List[int] = Field(
+        description="공유 링크 담당자로 지정할 EMPLOYEE 사용자 ID 목록",
+        examples=[[1]],
+    )
 
 
 class ShareLinkCreateRequest(BaseModel):
-    clientName: str
-    expiresInDays: int
-    assignedStaffUserId: Optional[int] = None
-    note: Optional[str] = None
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "clientName": "A뷰티",
+                    "expiresInDays": 7,
+                    "assignedStaffUserId": 1,
+                    "note": "고객사 최종 검토용 링크",
+                }
+            ]
+        }
+    )
+
+    clientName: str = Field(description="공유 링크를 전달할 고객사명", examples=["A뷰티"])
+    expiresInDays: Literal[1, 3, 7] = Field(
+        description="공유 링크 만료 기간. 1, 3, 7일만 허용됩니다.",
+        examples=[7],
+    )
+    assignedStaffUserId: Optional[int] = Field(
+        default=None,
+        description="공유 링크 담당 직원 ID. 지정하지 않으면 null입니다.",
+        examples=[1],
+    )
+    note: Optional[str] = Field(
+        default=None,
+        description="공유 링크 메모",
+        examples=["고객사 최종 검토용 링크"],
+    )
 
 
 def get_db():
@@ -824,8 +893,12 @@ def update_project_staff_assignees(
 @app.post("/api/projects/{project_id}/files", status_code=201)
 def upload_file(
     project_id: int,
-    fileType: str = Form(...),
-    file: UploadFile = File(...),
+    fileType: Literal["WORKING", "REPORT", "CLIENT_FINAL"] = Form(
+        ...,
+        description="파일 분류. WORKING, REPORT, CLIENT_FINAL 중 하나",
+        examples=["WORKING"],
+    ),
+    file: UploadFile = File(..., description="업로드할 파일"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1011,7 +1084,7 @@ def download_share_link_file(token: str, request: Request, db: Session = Depends
 @app.get("/api/projects/{project_id}/files")
 def get_project_files(
     project_id: int,
-    fileType: Optional[str] = None,
+    fileType: Optional[Literal["WORKING", "REPORT", "CLIENT_FINAL"]] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
