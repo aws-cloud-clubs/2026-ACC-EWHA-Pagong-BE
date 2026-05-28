@@ -779,7 +779,9 @@ def get_projects(
                 "clientId": membership.project.client_id,
                 "clientName": membership.project.client_name,
                 "status": membership.project.status,
-                "myProjectRole": membership.project_role
+                "myProjectRole": membership.project_role,
+                "createdAt": membership.project.created_at,
+                "updatedAt": membership.project.updated_at
             }
             for membership in memberships
         ]
