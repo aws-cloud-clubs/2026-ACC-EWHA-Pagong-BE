@@ -110,11 +110,22 @@ class User(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class Client(Base):
+    __tablename__ = "clients"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
 class Project(Base):
     __tablename__ = "projects"
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=True)
     client_name = Column(String, nullable=False)
     description = Column(String, nullable=True)
     status = Column(String, default="ACTIVE")  # ACTIVE, CLOSED
@@ -125,6 +136,7 @@ class Project(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
     creator = relationship("User")
+    client = relationship("Client")
 
 
 class ProjectMember(Base):
@@ -171,17 +183,18 @@ class ShareLink(Base):
     id = Column(Integer, primary_key=True, index=True)
     file_id = Column(Integer, ForeignKey("files.id"), nullable=False)
     token = Column(String, unique=True, nullable=False)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=True)
     client_name = Column(String, nullable=False)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     assigned_staff_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     expires_at = Column(DateTime, nullable=False)
     status = Column(String, default="ACTIVE")  # ACTIVE, EXPIRED, REVOKED
-    note = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
     file = relationship("StoredFile", foreign_keys=[file_id])
+    client = relationship("Client", foreign_keys=[client_id])
     creator = relationship("User", foreign_keys=[created_by])
     assigned_staff = relationship("User", foreign_keys=[assigned_staff_user_id])
 
@@ -210,6 +223,10 @@ class AuditLog(Base):
 class LoginRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
+            "example": {
+                "email": "employee@pagong.test",
+                "password": "pagong1234",
+            },
             "examples": [
                 {
                     "email": "employee@pagong.test",
@@ -234,10 +251,21 @@ class ProjectMemberInput(BaseModel):
 class ProjectCreateRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
+            "example": {
+                "name": "A뷰티 여름 캠페인",
+                "clientId": 1,
+                "description": "여름 신제품 런칭 캠페인",
+                "members": [
+                    {
+                        "userId": 1,
+                        "projectRole": "MEMBER",
+                    }
+                ],
+            },
             "examples": [
                 {
                     "name": "A뷰티 여름 캠페인",
-                    "clientName": "A뷰티",
+                    "clientId": 1,
                     "description": "여름 신제품 런칭 캠페인",
                     "members": [
                         {
@@ -251,7 +279,7 @@ class ProjectCreateRequest(BaseModel):
     )
 
     name: str = Field(description="프로젝트명", examples=["A뷰티 여름 캠페인"])
-    clientName: str = Field(description="고객사명", examples=["A뷰티"])
+    clientId: int = Field(description="고객사 ID. GET /api/clients에서 조회한 id를 사용합니다.", examples=[1])
     description: Optional[str] = Field(
         default=None,
         description="프로젝트 설명",
@@ -266,6 +294,9 @@ class ProjectCreateRequest(BaseModel):
 class ProjectStaffUpdateRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
+            "example": {
+                "staffUserIds": [1],
+            },
             "examples": [
                 {
                     "staffUserIds": [1],
@@ -283,18 +314,22 @@ class ProjectStaffUpdateRequest(BaseModel):
 class ShareLinkCreateRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
+            "example": {
+                "clientId": 1,
+                "expiresInDays": 7,
+                "assignedStaffUserId": 1,
+            },
             "examples": [
                 {
-                    "clientName": "A뷰티",
+                    "clientId": 1,
                     "expiresInDays": 7,
                     "assignedStaffUserId": 1,
-                    "note": "고객사 최종 검토용 링크",
                 }
             ]
         }
     )
 
-    clientName: str = Field(description="공유 링크를 전달할 고객사명", examples=["A뷰티"])
+    clientId: int = Field(description="공유 링크를 전달할 고객사 ID", examples=[1])
     expiresInDays: Literal[1, 3, 7] = Field(
         description="공유 링크 만료 기간. 1, 3, 7일만 허용됩니다.",
         examples=[7],
@@ -303,11 +338,6 @@ class ShareLinkCreateRequest(BaseModel):
         default=None,
         description="공유 링크 담당 직원 ID. 지정하지 않으면 null입니다.",
         examples=[1],
-    )
-    note: Optional[str] = Field(
-        default=None,
-        description="공유 링크 메모",
-        examples=["고객사 최종 검토용 링크"],
     )
 
 
@@ -536,9 +566,15 @@ def startup():
         db.add_all([employee, manager, executive])
         db.commit()
 
+        client1 = Client(id=1, name="A뷰티")
+        client2 = Client(id=2, name="B식품")
+        db.add_all([client1, client2])
+        db.commit()
+
         project1 = Project(
             id=1,
             name="A뷰티 여름 캠페인",
+            client_id=1,
             client_name="A뷰티",
             description="여름 신제품 런칭 캠페인",
             status="ACTIVE",
@@ -548,6 +584,7 @@ def startup():
         project2 = Project(
             id=2,
             name="B식품 SNS 광고 프로젝트",
+            client_id=2,
             client_name="B식품",
             description="SNS 광고 콘텐츠 제작 프로젝트",
             status="ACTIVE",
@@ -612,6 +649,24 @@ def get_me(current_user: User = Depends(get_current_user)):
     }
 
 
+@app.get("/api/clients")
+def get_clients(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    clients = db.query(Client).order_by(Client.id.asc()).all()
+
+    return {
+        "clients": [
+            {
+                "clientId": client.id,
+                "clientName": client.name
+            }
+            for client in clients
+        ]
+    }
+
+
 @app.post("/api/projects", status_code=201)
 def create_project(
     payload: ProjectCreateRequest,
@@ -623,8 +678,9 @@ def create_project(
     if not payload.name.strip():
         raise HTTPException(status_code=400, detail="프로젝트명은 필수입니다.")
 
-    if not payload.clientName.strip():
-        raise HTTPException(status_code=400, detail="고객사명은 필수입니다.")
+    client = db.query(Client).filter(Client.id == payload.clientId).first()
+    if not client:
+        raise HTTPException(status_code=400, detail="존재하지 않는 고객사 ID입니다.")
 
     members = payload.members or []
 
@@ -650,7 +706,8 @@ def create_project(
 
     project = Project(
         name=payload.name,
-        client_name=payload.clientName,
+        client_id=client.id,
+        client_name=client.name,
         description=payload.description,
         status="ACTIVE",
         created_by=current_user.id
@@ -694,6 +751,7 @@ def create_project(
     return {
         "projectId": project.id,
         "name": project.name,
+        "clientId": project.client_id,
         "clientName": project.client_name,
         "description": project.description,
         "status": project.status,
@@ -725,6 +783,7 @@ def get_projects(
             {
                 "projectId": membership.project.id,
                 "name": membership.project.name,
+                "clientId": membership.project.client_id,
                 "clientName": membership.project.client_name,
                 "status": membership.project.status,
                 "myProjectRole": membership.project_role
@@ -755,6 +814,7 @@ def get_project_detail(
     return {
         "projectId": project.id,
         "name": project.name,
+        "clientId": project.client_id,
         "clientName": project.client_name,
         "description": project.description,
         "status": project.status,
@@ -972,8 +1032,13 @@ def create_share_link(
     if not is_project_member(db, current_user.id, file_record.project_id):
         raise HTTPException(status_code=403, detail="프로젝트 접근 권한이 없습니다.")
 
-    if not payload.clientName.strip():
-        raise HTTPException(status_code=400, detail="고객사명은 필수입니다.")
+    client = db.query(Client).filter(Client.id == payload.clientId).first()
+    if not client:
+        raise HTTPException(status_code=400, detail="존재하지 않는 고객사 ID입니다.")
+
+    if file_record.project and file_record.project.client_id:
+        if file_record.project.client_id != client.id:
+            raise HTTPException(status_code=400, detail="파일의 프로젝트 고객사와 clientId가 일치하지 않습니다.")
 
     assigned_staff_user_id = payload.assignedStaffUserId
     if assigned_staff_user_id is not None:
@@ -990,12 +1055,12 @@ def create_share_link(
     share_link = ShareLink(
         file_id=file_id,
         token=token,
-        client_name=payload.clientName.strip(),
+        client_id=client.id,
+        client_name=client.name,
         created_by=current_user.id,
         assigned_staff_user_id=assigned_staff_user_id,
         expires_at=expires_at,
-        status="ACTIVE",
-        note=payload.note
+        status="ACTIVE"
     )
 
     db.add(share_link)
@@ -1008,14 +1073,15 @@ def create_share_link(
     return {
         "shareLinkId": share_link.id,
         "fileId": share_link.file_id,
+        "projectId": file_record.project_id,
         "token": share_link.token,
         "url": share_url,
+        "clientId": share_link.client_id,
         "clientName": share_link.client_name,
         "createdBy": share_link.created_by,
         "assignedStaffUserId": share_link.assigned_staff_user_id,
         "expiresAt": share_link.expires_at,
-        "status": share_link.status,
-        "note": share_link.note
+        "status": share_link.status
     }
 
 
@@ -1046,7 +1112,10 @@ def get_share_link(token: str, request: Request, db: Session = Depends(get_db)):
         "fileSize": file_record.file_size,
         "mimeType": file_record.mime_type,
         "fileType": file_record.file_type,
+        "clientId": share_link.client_id,
         "clientName": share_link.client_name,
+        "createdBy": share_link.created_by,
+        "assignedStaffUserId": share_link.assigned_staff_user_id,
         "expiresAt": share_link.expires_at,
         "status": share_link.status
     }
