@@ -1,15 +1,17 @@
 import os
 import uuid
 import shutil
+from io import BytesIO
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional, List, Literal
 
+import boto3  # pyright: ignore[reportMissingImports]
 import jwt
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
@@ -22,6 +24,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
+from botocore.exceptions import BotoCoreError, ClientError  # pyright: ignore[reportMissingImports]
 
 
 load_dotenv()
@@ -54,8 +57,25 @@ DATABASE_URL = os.getenv(
     "postgresql+psycopg://postgres:postgres@localhost:5432/file_share",
 )
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+STORAGE_BACKEND_ENV = os.getenv("STORAGE_BACKEND")
+STORAGE_BACKEND = (STORAGE_BACKEND_ENV or "").strip().lower()
+S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
+AWS_REGION = os.getenv("AWS_REGION", "").strip()
+S3_REGION = os.getenv("S3_REGION", "").strip() or AWS_REGION or None
+S3_PREFIX = os.getenv("S3_PREFIX", "uploads").strip().strip("/")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+if STORAGE_BACKEND not in {"", "local", "s3"}:
+    raise RuntimeError("STORAGE_BACKEND는 local 또는 s3만 허용됩니다.")
+
+# STORAGE_BACKEND 미지정 시 S3_BUCKET 존재 여부로 자동 선택합니다.
+USE_S3 = STORAGE_BACKEND == "s3" or (STORAGE_BACKEND == "" and bool(S3_BUCKET))
+
+if STORAGE_BACKEND == "s3" and not S3_BUCKET:
+    raise RuntimeError("STORAGE_BACKEND=s3 인 경우 S3_BUCKET 설정이 필요합니다.")
+
+s3_client = boto3.client("s3", region_name=S3_REGION) if USE_S3 else None
 
 engine = create_engine(DATABASE_URL)
 
@@ -66,6 +86,97 @@ SessionLocal = sessionmaker(
 )
 
 Base = declarative_base()
+
+
+def _build_s3_key(stored_filename: str) -> str:
+    if not S3_PREFIX:
+        return stored_filename
+    return f"{S3_PREFIX}/{stored_filename}"
+
+
+def _parse_s3_storage_path(storage_path: str) -> tuple[str, str]:
+    if not storage_path.startswith("s3://"):
+        raise HTTPException(status_code=500, detail="S3 storage path 형식이 올바르지 않습니다.")
+
+    remainder = storage_path[len("s3://"):]
+    parts = remainder.split("/", 1)
+    if len(parts) != 2:
+        raise HTTPException(status_code=500, detail="S3 storage path 형식이 올바르지 않습니다.")
+    return parts[0], parts[1]
+
+
+def save_uploaded_file(file: UploadFile, stored_filename: str) -> tuple[str, int]:
+    if USE_S3:
+        if s3_client is None:
+            raise HTTPException(status_code=500, detail="S3 클라이언트가 초기화되지 않았습니다.")
+        key = _build_s3_key(stored_filename)
+        try:
+            content = file.file.read()
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=key,
+                Body=content,
+                ContentType=file.content_type or "application/octet-stream",
+            )
+        except (BotoCoreError, ClientError):
+            raise HTTPException(status_code=500, detail="S3 파일 저장에 실패했습니다.")
+
+        return f"s3://{S3_BUCKET}/{key}", len(content)
+
+    storage_path = os.path.join(UPLOAD_DIR, stored_filename)
+    try:
+        with open(storage_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception:
+        raise HTTPException(status_code=500, detail="파일 저장에 실패했습니다.")
+
+    file_size = os.path.getsize(storage_path)
+    return storage_path, file_size
+
+
+def ensure_file_exists(storage_path: str) -> None:
+    if storage_path.startswith("s3://"):
+        if s3_client is None:
+            raise HTTPException(status_code=500, detail="S3 클라이언트가 초기화되지 않았습니다.")
+        bucket, key = _parse_s3_storage_path(storage_path)
+        try:
+            s3_client.head_object(Bucket=bucket, Key=key)
+        except ClientError:
+            raise HTTPException(status_code=404, detail="저장된 파일을 찾을 수 없습니다.")
+        except BotoCoreError:
+            raise HTTPException(status_code=500, detail="S3 파일 조회에 실패했습니다.")
+        return
+
+    if not os.path.exists(storage_path):
+        raise HTTPException(status_code=404, detail="저장된 파일을 찾을 수 없습니다.")
+
+
+def build_download_response(file_record: "StoredFile"):
+    if file_record.storage_path.startswith("s3://"):
+        if s3_client is None:
+            raise HTTPException(status_code=500, detail="S3 클라이언트가 초기화되지 않았습니다.")
+        bucket, key = _parse_s3_storage_path(file_record.storage_path)
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=key)
+            body = obj["Body"].read()
+        except ClientError:
+            raise HTTPException(status_code=404, detail="저장된 파일을 찾을 수 없습니다.")
+        except BotoCoreError:
+            raise HTTPException(status_code=500, detail="S3 파일 다운로드에 실패했습니다.")
+
+        filename = file_record.original_filename.replace('"', "")
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(
+            BytesIO(body),
+            media_type=file_record.mime_type or "application/octet-stream",
+            headers=headers,
+        )
+
+    return FileResponse(
+        path=file_record.storage_path,
+        filename=file_record.original_filename,
+        media_type=file_record.mime_type
+    )
 
 
 @asynccontextmanager
@@ -516,6 +627,14 @@ def startup():
     if APP_ENV == "production" and JWT_SECRET_KEY == "dev-secret-change-this":
         raise RuntimeError("JWT_SECRET_KEY must be set in production.")
 
+    if USE_S3:
+        try:
+            s3_client.head_bucket(Bucket=S3_BUCKET)
+        except ClientError as exc:
+            raise RuntimeError("S3 연결 확인에 실패했습니다. S3_BUCKET/권한/리전을 확인하세요.") from exc
+        except BotoCoreError as exc:
+            raise RuntimeError("S3 클라이언트 초기화에 실패했습니다.") from exc
+
     if not AUTO_SEED_DATA:
         return
 
@@ -749,6 +868,7 @@ def create_project(
         "description": project.description,
         "status": project.status,
         "createdBy": project.created_by,
+        "createdAt": project.created_at,
         "members": [
             {
                 "userId": member.user.id,
@@ -969,15 +1089,7 @@ def upload_file(
 
     ext = os.path.splitext(file.filename)[1]
     stored_filename = f"{uuid.uuid4()}{ext}"
-    storage_path = os.path.join(UPLOAD_DIR, stored_filename)
-
-    try:
-        with open(storage_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception:
-        raise HTTPException(status_code=500, detail="파일 저장에 실패했습니다.")
-
-    file_size = os.path.getsize(storage_path)
+    storage_path, file_size = save_uploaded_file(file, stored_filename)
 
     file_record = StoredFile(
         project_id=project_id,
@@ -1113,8 +1225,7 @@ def download_share_link_file(token: str, request: Request, db: Session = Depends
     if not file_record:
         raise HTTPException(status_code=404, detail="공유 대상 파일을 찾을 수 없습니다.")
 
-    if not os.path.exists(file_record.storage_path):
-        raise HTTPException(status_code=404, detail="저장된 파일을 찾을 수 없습니다.")
+    ensure_file_exists(file_record.storage_path)
 
     write_audit_log(
         db=db,
@@ -1125,11 +1236,7 @@ def download_share_link_file(token: str, request: Request, db: Session = Depends
         request=request,
     )
 
-    return FileResponse(
-        path=file_record.storage_path,
-        filename=file_record.original_filename,
-        media_type=file_record.mime_type
-    )
+    return build_download_response(file_record)
 
 
 @app.get("/api/projects/{project_id}/files")
@@ -1245,8 +1352,7 @@ def download_file(
     if not can_access_file(current_user.role, file_record.file_type):
         raise HTTPException(status_code=403, detail="파일 다운로드 권한이 없습니다.")
 
-    if not os.path.exists(file_record.storage_path):
-        raise HTTPException(status_code=404, detail="저장된 파일을 찾을 수 없습니다.")
+    ensure_file_exists(file_record.storage_path)
 
     write_audit_log(
         db=db,
@@ -1257,11 +1363,7 @@ def download_file(
         request=request,
     )
 
-    return FileResponse(
-        path=file_record.storage_path,
-        filename=file_record.original_filename,
-        media_type=file_record.mime_type
-    )
+    return build_download_response(file_record)
 
 
 @app.get("/api/files/{file_id}/logs")
