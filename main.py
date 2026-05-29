@@ -429,19 +429,22 @@ class ShareLinkCreateRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "clientId": 1,
+                "clientName": "A뷰티",
                 "expiresInDays": 7,
             },
             "examples": [
                 {
-                    "clientId": 1,
+                    "clientName": "A뷰티",
                     "expiresInDays": 7,
                 }
             ]
         }
     )
 
-    clientId: int = Field(description="공유 링크를 전달할 고객사 ID", examples=[1])
+    clientName: str = Field(
+        description="공유 링크를 전달할 고객사명. 없으면 clients 테이블에 자동 생성됩니다.",
+        examples=["A뷰티"],
+    )
     expiresInDays: Literal[1, 3, 7] = Field(
         description="공유 링크 만료 기간. 1, 3, 7일만 허용됩니다.",
         examples=[7],
@@ -1162,13 +1165,20 @@ def create_share_link(
     if not is_project_member(db, current_user.id, file_record.project_id):
         raise HTTPException(status_code=403, detail="프로젝트 접근 권한이 없습니다.")
 
-    client = db.query(Client).filter(Client.id == payload.clientId).first()
-    if not client:
-        raise HTTPException(status_code=400, detail="존재하지 않는 고객사 ID입니다.")
+    client = get_or_create_client_by_name(db, payload.clientName)
 
-    if file_record.project and file_record.project.client_id:
-        if file_record.project.client_id != client.id:
-            raise HTTPException(status_code=400, detail="파일의 프로젝트 고객사와 clientId가 일치하지 않습니다.")
+    project = file_record.project
+    if project:
+        if project.client_id is not None and project.client_id != client.id:
+            raise HTTPException(
+                status_code=400,
+                detail="파일의 프로젝트 고객사와 clientName이 일치하지 않습니다.",
+            )
+        if project.client_id is None and project.client_name != client.name:
+            raise HTTPException(
+                status_code=400,
+                detail="파일의 프로젝트 고객사와 clientName이 일치하지 않습니다.",
+            )
 
     token = uuid.uuid4().hex
     expires_at = datetime.utcnow() + timedelta(days=payload.expiresInDays)
