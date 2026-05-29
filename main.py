@@ -5,13 +5,14 @@ from io import BytesIO
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional, List, Literal
+from urllib.parse import quote
 
 import boto3  # pyright: ignore[reportMissingImports]
 import jwt
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
@@ -63,17 +64,25 @@ S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
 AWS_REGION = os.getenv("AWS_REGION", "").strip()
 S3_REGION = os.getenv("S3_REGION", "").strip() or AWS_REGION or None
 S3_PREFIX = os.getenv("S3_PREFIX", "uploads").strip().strip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+PRESIGNED_URL_EXPIRES_IN = get_env_int("PRESIGNED_URL_EXPIRES_IN", 3600)
+USE_S3_FLAG = get_env_bool("USE_S3", False)
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 if STORAGE_BACKEND not in {"", "local", "s3"}:
     raise RuntimeError("STORAGE_BACKEND는 local 또는 s3만 허용됩니다.")
 
-# STORAGE_BACKEND 미지정 시 S3_BUCKET 존재 여부로 자동 선택합니다.
-USE_S3 = STORAGE_BACKEND == "s3" or (STORAGE_BACKEND == "" and bool(S3_BUCKET))
+# STORAGE_BACKEND / USE_S3 / S3_BUCKET 조합으로 S3 사용 여부 결정
+if STORAGE_BACKEND == "s3" or USE_S3_FLAG:
+    USE_S3 = bool(S3_BUCKET)
+elif STORAGE_BACKEND == "local":
+    USE_S3 = False
+else:
+    USE_S3 = bool(S3_BUCKET)
 
-if STORAGE_BACKEND == "s3" and not S3_BUCKET:
-    raise RuntimeError("STORAGE_BACKEND=s3 인 경우 S3_BUCKET 설정이 필요합니다.")
+if (STORAGE_BACKEND == "s3" or USE_S3_FLAG) and not S3_BUCKET:
+    raise RuntimeError("S3 사용 시 S3_BUCKET 설정이 필요합니다.")
 
 s3_client = boto3.client("s3", region_name=S3_REGION) if USE_S3 else None
 
@@ -103,6 +112,94 @@ def _parse_s3_storage_path(storage_path: str) -> tuple[str, str]:
     if len(parts) != 2:
         raise HTTPException(status_code=500, detail="S3 storage path 형식이 올바르지 않습니다.")
     return parts[0], parts[1]
+
+
+def get_public_base_url(request: Optional[Request] = None) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    if request is not None:
+        return f"{request.url.scheme}://{request.url.netloc}"
+    return "http://127.0.0.1:8000"
+
+
+def build_content_disposition(filename: str) -> str:
+    """RFC 5987 filename* 인코딩으로 한글 파일명 다운로드 지원."""
+    ascii_fallback = "".join(
+        ch if ch.isascii() and ch not in {'"', "\\"} else "_"
+        for ch in filename
+    ).strip() or "download"
+    encoded = quote(filename, safe="")
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
+
+
+def generate_presigned_download_url(
+    bucket: str,
+    key: str,
+    *,
+    original_filename: str,
+    mime_type: Optional[str] = None,
+    expires_in: Optional[int] = None,
+) -> str:
+    if s3_client is None:
+        raise HTTPException(status_code=500, detail="S3 클라이언트가 초기화되지 않았습니다.")
+
+    params = {
+        "Bucket": bucket,
+        "Key": key,
+        "ResponseContentDisposition": build_content_disposition(original_filename),
+    }
+    if mime_type:
+        params["ResponseContentType"] = mime_type
+
+    try:
+        return s3_client.generate_presigned_url(
+            "get_object",
+            Params=params,
+            ExpiresIn=expires_in or PRESIGNED_URL_EXPIRES_IN,
+        )
+    except (BotoCoreError, ClientError):
+        raise HTTPException(status_code=500, detail="S3 presigned 다운로드 URL 생성에 실패했습니다.")
+
+
+def generate_presigned_upload_url(
+    bucket: str,
+    key: str,
+    *,
+    content_type: Optional[str] = None,
+    expires_in: Optional[int] = None,
+) -> str:
+    if s3_client is None:
+        raise HTTPException(status_code=500, detail="S3 클라이언트가 초기화되지 않았습니다.")
+
+    params = {
+        "Bucket": bucket,
+        "Key": key,
+    }
+    if content_type:
+        params["ContentType"] = content_type
+
+    try:
+        return s3_client.generate_presigned_url(
+            "put_object",
+            Params=params,
+            ExpiresIn=expires_in or PRESIGNED_URL_EXPIRES_IN,
+        )
+    except (BotoCoreError, ClientError):
+        raise HTTPException(status_code=500, detail="S3 presigned 업로드 URL 생성에 실패했습니다.")
+
+
+def build_presigned_download_for_file(file_record: "StoredFile") -> str:
+    if not file_record.storage_path.startswith("s3://"):
+        raise HTTPException(status_code=500, detail="S3 파일만 presigned URL을 사용할 수 있습니다.")
+
+    bucket, key = _parse_s3_storage_path(file_record.storage_path)
+    ensure_file_exists(file_record.storage_path)
+    return generate_presigned_download_url(
+        bucket,
+        key,
+        original_filename=file_record.original_filename,
+        mime_type=file_record.mime_type,
+    )
 
 
 def save_uploaded_file(file: UploadFile, stored_filename: str) -> tuple[str, int]:
@@ -405,23 +502,37 @@ class ProjectCreateRequest(BaseModel):
     )
 
 
-class ProjectStaffUpdateRequest(BaseModel):
+class ProjectMembersUpdateRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "staffUserIds": [1],
+                "members": [
+                    {
+                        "userId": 1,
+                        "projectRole": "MEMBER",
+                    },
+                    {
+                        "userId": 3,
+                        "projectRole": "VIEWER",
+                    },
+                ],
             },
             "examples": [
                 {
-                    "staffUserIds": [1],
+                    "members": [
+                        {
+                            "userId": 1,
+                            "projectRole": "MEMBER",
+                        }
+                    ],
                 }
-            ]
+            ],
         }
     )
 
-    staffUserIds: List[int] = Field(
-        description="프로젝트 담당 직원으로 지정할 EMPLOYEE 사용자 ID 목록",
-        examples=[[1]],
+    members: List[ProjectMemberInput] = Field(
+        default_factory=list,
+        description="프로젝트 참여자 전체 목록(LEADER 제외). 요청에 없는 기존 참여자는 제거됩니다.",
     )
 
 
@@ -591,17 +702,17 @@ def validate_share_link_expiry_days(expires_in_days: int):
         raise HTTPException(status_code=400, detail=f"expiresInDays는 {allowed} 중 하나여야 합니다.")
 
 
-def is_project_staff_assignee(db: Session, project_id: int, user_id: int) -> bool:
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user or user.role != "EMPLOYEE":
-        return False
-
-    member = db.query(ProjectMember).filter(
-        ProjectMember.project_id == project_id,
-        ProjectMember.user_id == user_id,
-        ProjectMember.project_role == "MEMBER"
-    ).first()
-    return member is not None
+def serialize_project_members(members: List[ProjectMember]) -> List[dict]:
+    return [
+        {
+            "userId": member.user.id,
+            "name": member.user.name,
+            "email": member.user.email,
+            "projectRole": member.project_role,
+        }
+        for member in members
+        if member.user
+    ]
 
 
 def get_client_ip(request: Request) -> Optional[str]:
@@ -978,8 +1089,8 @@ def get_project_detail(
     }
 
 
-@app.get("/api/projects/{project_id}/staff-assignees")
-def get_project_staff_assignees(
+@app.get("/api/projects/{project_id}/members")
+def get_project_members(
     project_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -993,29 +1104,20 @@ def get_project_staff_assignees(
     if not project:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
 
-    assignee_members = db.query(ProjectMember).filter(
-        ProjectMember.project_id == project_id,
-        ProjectMember.project_role == "MEMBER"
+    members = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id
     ).all()
 
     return {
         "projectId": project_id,
-        "staffAssignees": [
-            {
-                "userId": member.user.id,
-                "name": member.user.name,
-                "email": member.user.email
-            }
-            for member in assignee_members
-            if member.user and member.user.role == "EMPLOYEE"
-        ]
+        "members": serialize_project_members(members),
     }
 
 
-@app.put("/api/projects/{project_id}/staff-assignees")
-def update_project_staff_assignees(
+@app.put("/api/projects/{project_id}/members")
+def update_project_members(
     project_id: int,
-    payload: ProjectStaffUpdateRequest,
+    payload: ProjectMembersUpdateRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1028,72 +1130,81 @@ def update_project_staff_assignees(
     if not project:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
 
-    unique_user_ids = list(dict.fromkeys(payload.staffUserIds))
-    if unique_user_ids:
-        users = db.query(User).filter(User.id.in_(unique_user_ids)).all()
-        user_map = {user.id: user for user in users}
+    members_input = payload.members or []
+    for member in members_input:
+        validate_project_role(member.projectRole)
 
-        invalid_user_ids = [user_id for user_id in unique_user_ids if user_id not in user_map]
+    leader_user_ids = {
+        member.user_id
+        for member in db.query(ProjectMember).filter(
+            ProjectMember.project_id == project_id,
+            ProjectMember.project_role == "LEADER",
+        ).all()
+    }
+
+    desired_members: dict[int, str] = {}
+    for member in members_input:
+        if member.userId in leader_user_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="프로젝트 LEADER는 members 목록에서 수정할 수 없습니다.",
+            )
+        if member.userId in desired_members:
+            continue
+        desired_members[member.userId] = member.projectRole
+
+    if desired_members:
+        existing_users = db.query(User).filter(User.id.in_(desired_members.keys())).all()
+        existing_user_ids = {user.id for user in existing_users}
+        invalid_user_ids = [
+            user_id for user_id in desired_members
+            if user_id not in existing_user_ids
+        ]
         if invalid_user_ids:
             raise HTTPException(
                 status_code=400,
-                detail=f"존재하지 않는 사용자 ID가 포함되어 있습니다: {invalid_user_ids}"
+                detail=f"존재하지 않는 사용자 ID가 포함되어 있습니다: {invalid_user_ids}",
             )
 
-        non_employee_ids = [
-            user_id for user_id in unique_user_ids
-            if user_map[user_id].role != "EMPLOYEE"
-        ]
-        if non_employee_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"담당 직원은 EMPLOYEE만 지정할 수 있습니다: {non_employee_ids}"
-            )
-
-        not_member_ids = [
-            user_id for user_id in unique_user_ids
-            if not is_project_member(db, user_id, project_id)
-        ]
-        if not_member_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=f"프로젝트 참여자가 아닌 사용자가 포함되어 있습니다: {not_member_ids}"
-            )
-
-    employee_members = db.query(ProjectMember).join(User, ProjectMember.user_id == User.id).filter(
-        ProjectMember.project_id == project_id,
-        User.role == "EMPLOYEE"
+    current_members = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id
     ).all()
 
-    for member in employee_members:
-        member.project_role = "VIEWER"
+    for member in current_members:
+        if member.project_role == "LEADER":
+            continue
+        if member.user_id not in desired_members:
+            db.delete(member)
 
-    selected_set = set(unique_user_ids)
-    selected_members = db.query(ProjectMember).filter(
-        ProjectMember.project_id == project_id,
-        ProjectMember.user_id.in_(selected_set)
-    ).all()
-    for member in selected_members:
-        member.project_role = "MEMBER"
+    current_by_user_id = {
+        member.user_id: member
+        for member in current_members
+        if member.project_role != "LEADER"
+    }
+
+    for user_id, project_role in desired_members.items():
+        existing = current_by_user_id.get(user_id)
+        if existing:
+            existing.project_role = project_role
+            continue
+
+        db.add(
+            ProjectMember(
+                project_id=project_id,
+                user_id=user_id,
+                project_role=project_role,
+            )
+        )
 
     db.commit()
 
-    saved_members = db.query(ProjectMember).join(User, ProjectMember.user_id == User.id).filter(
-        ProjectMember.project_id == project_id,
-        ProjectMember.project_role == "MEMBER",
-        User.role == "EMPLOYEE"
+    saved_members = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id
     ).all()
 
     return {
         "projectId": project_id,
-        "staffAssignees": [
-            {
-                "userId": member.user.id,
-                "name": member.user.name,
-                "email": member.user.email
-            }
-            for member in saved_members
-        ]
+        "members": serialize_project_members(saved_members),
     }
 
 
@@ -1155,6 +1266,7 @@ def upload_file(
 def create_share_link(
     file_id: int,
     payload: ShareLinkCreateRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1193,8 +1305,7 @@ def create_share_link(
     db.commit()
     db.refresh(share_link)
 
-    base_url = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")
-    share_url = f"{base_url}/api/share-links/{share_link.token}"
+    share_url = f"{get_public_base_url(request)}/api/share-links/{share_link.token}"
 
     return {
         "shareLinkId": share_link.id,
@@ -1246,7 +1357,15 @@ def get_share_link(token: str, request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/api/share-links/{token}/download")
-def download_share_link_file(token: str, request: Request, db: Session = Depends(get_db)):
+def download_share_link_file(
+    token: str,
+    request: Request,
+    response_format: Optional[Literal["json", "redirect"]] = Query(
+        default=None,
+        description="json: presigned URL JSON 반환, redirect: S3로 307 리다이렉트(기본)",
+    ),
+    db: Session = Depends(get_db),
+):
     share_link = get_active_share_link(db, token)
     file_record = db.query(StoredFile).filter(
         StoredFile.id == share_link.file_id,
@@ -1254,8 +1373,6 @@ def download_share_link_file(token: str, request: Request, db: Session = Depends
     ).first()
     if not file_record:
         raise HTTPException(status_code=404, detail="공유 대상 파일을 찾을 수 없습니다.")
-
-    ensure_file_exists(file_record.storage_path)
 
     write_audit_log(
         db=db,
@@ -1266,6 +1383,17 @@ def download_share_link_file(token: str, request: Request, db: Session = Depends
         request=request,
     )
 
+    if USE_S3 and file_record.storage_path.startswith("s3://"):
+        download_url = build_presigned_download_for_file(file_record)
+        if response_format == "json":
+            return {
+                "downloadUrl": download_url,
+                "expiresIn": PRESIGNED_URL_EXPIRES_IN,
+                "originalFilename": file_record.original_filename,
+            }
+        return RedirectResponse(url=download_url, status_code=307)
+
+    ensure_file_exists(file_record.storage_path)
     return build_download_response(file_record)
 
 
