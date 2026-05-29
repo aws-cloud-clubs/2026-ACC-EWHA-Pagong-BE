@@ -22,7 +22,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
 )
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from botocore.exceptions import BotoCoreError, ClientError  # pyright: ignore[reportMissingImports]
 
@@ -364,7 +364,7 @@ class ProjectCreateRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "name": "A뷰티 여름 캠페인",
-                "clientId": 1,
+                "clientName": "A뷰티",
                 "description": "여름 신제품 런칭 캠페인",
                 "members": [
                     {
@@ -376,7 +376,7 @@ class ProjectCreateRequest(BaseModel):
             "examples": [
                 {
                     "name": "A뷰티 여름 캠페인",
-                    "clientId": 1,
+                    "clientName": "A뷰티",
                     "description": "여름 신제품 런칭 캠페인",
                     "members": [
                         {
@@ -390,7 +390,10 @@ class ProjectCreateRequest(BaseModel):
     )
 
     name: str = Field(description="프로젝트명", examples=["A뷰티 여름 캠페인"])
-    clientId: int = Field(description="고객사 ID. GET /api/clients에서 조회한 id를 사용합니다.", examples=[1])
+    clientName: str = Field(
+        description="고객사명. 없으면 clients 테이블에 자동 생성됩니다.",
+        examples=["A뷰티"],
+    )
     description: Optional[str] = Field(
         default=None,
         description="프로젝트 설명",
@@ -543,6 +546,29 @@ def validate_project_role(project_role: str):
             status_code=400,
             detail=f"projectRole은 {allowed} 중 하나여야 합니다."
         )
+
+
+def get_or_create_client_by_name(db: Session, client_name: str) -> Client:
+    normalized = client_name.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="고객사명은 필수입니다.")
+
+    client = db.query(Client).filter(Client.name == normalized).first()
+    if client:
+        return client
+
+    client = Client(name=normalized)
+    db.add(client)
+    try:
+        db.commit()
+        db.refresh(client)
+        return client
+    except IntegrityError:
+        db.rollback()
+        client = db.query(Client).filter(Client.name == normalized).first()
+        if not client:
+            raise HTTPException(status_code=500, detail="고객사 생성에 실패했습니다.")
+        return client
 
 
 def require_manager_or_executive(user: User):
@@ -790,9 +816,7 @@ def create_project(
     if not payload.name.strip():
         raise HTTPException(status_code=400, detail="프로젝트명은 필수입니다.")
 
-    client = db.query(Client).filter(Client.id == payload.clientId).first()
-    if not client:
-        raise HTTPException(status_code=400, detail="존재하지 않는 고객사 ID입니다.")
+    client = get_or_create_client_by_name(db, payload.clientName)
 
     members = payload.members or []
 
@@ -868,7 +892,6 @@ def create_project(
         "description": project.description,
         "status": project.status,
         "createdBy": project.created_by,
-        "createdAt": project.created_at,
         "members": [
             {
                 "userId": member.user.id,
