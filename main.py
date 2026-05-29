@@ -68,6 +68,9 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 PRESIGNED_URL_EXPIRES_IN = get_env_int("PRESIGNED_URL_EXPIRES_IN", 3600)
 USE_S3_FLAG = get_env_bool("USE_S3", False)
 
+# 쉼표 구분. 예: https://pagong.dev,http://localhost:3000
+CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS", "").strip()
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 if STORAGE_BACKEND not in {"", "local", "s3"}:
@@ -112,6 +115,31 @@ def _parse_s3_storage_path(storage_path: str) -> tuple[str, str]:
     if len(parts) != 2:
         raise HTTPException(status_code=500, detail="S3 storage path 형식이 올바르지 않습니다.")
     return parts[0], parts[1]
+
+
+def parse_cors_origins(raw: str) -> List[str]:
+    origins: List[str] = []
+    for item in raw.split(","):
+        origin = item.strip().rstrip("/")
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+def get_cors_origins() -> List[str]:
+    configured = parse_cors_origins(CORS_ORIGINS_RAW)
+    if configured:
+        return configured
+
+    if APP_ENV == "production":
+        return []
+
+    return [
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8000",
+    ]
 
 
 def get_public_base_url(request: Optional[Request] = None) -> str:
@@ -323,9 +351,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+_cors_origins = get_cors_origins()
+if not _cors_origins and APP_ENV == "production":
+    raise RuntimeError(
+        "CORS_ORIGINS must be set in production. "
+        "Example: https://pagong.dev,http://localhost:3000"
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
