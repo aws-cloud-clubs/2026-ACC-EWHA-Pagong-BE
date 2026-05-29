@@ -429,22 +429,16 @@ class ShareLinkCreateRequest(BaseModel):
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "clientName": "A뷰티",
                 "expiresInDays": 7,
             },
             "examples": [
                 {
-                    "clientName": "A뷰티",
                     "expiresInDays": 7,
                 }
             ]
         }
     )
 
-    clientName: str = Field(
-        description="공유 링크를 전달할 고객사명. 없으면 clients 테이블에 자동 생성됩니다.",
-        examples=["A뷰티"],
-    )
     expiresInDays: Literal[1, 3, 7] = Field(
         description="공유 링크 만료 기간. 1, 3, 7일만 허용됩니다.",
         examples=[7],
@@ -572,6 +566,18 @@ def get_or_create_client_by_name(db: Session, client_name: str) -> Client:
         if not client:
             raise HTTPException(status_code=500, detail="고객사 생성에 실패했습니다.")
         return client
+
+
+def get_client_for_project(db: Session, project: Project) -> Client:
+    if project.client_id is not None:
+        client = db.query(Client).filter(Client.id == project.client_id).first()
+        if client:
+            return client
+
+    if project.client_name and project.client_name.strip():
+        return get_or_create_client_by_name(db, project.client_name)
+
+    raise HTTPException(status_code=400, detail="프로젝트에 고객사 정보가 없습니다.")
 
 
 def require_manager_or_executive(user: User):
@@ -1165,20 +1171,11 @@ def create_share_link(
     if not is_project_member(db, current_user.id, file_record.project_id):
         raise HTTPException(status_code=403, detail="프로젝트 접근 권한이 없습니다.")
 
-    client = get_or_create_client_by_name(db, payload.clientName)
+    project = db.query(Project).filter(Project.id == file_record.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
 
-    project = file_record.project
-    if project:
-        if project.client_id is not None and project.client_id != client.id:
-            raise HTTPException(
-                status_code=400,
-                detail="파일의 프로젝트 고객사와 clientName이 일치하지 않습니다.",
-            )
-        if project.client_id is None and project.client_name != client.name:
-            raise HTTPException(
-                status_code=400,
-                detail="파일의 프로젝트 고객사와 clientName이 일치하지 않습니다.",
-            )
+    client = get_client_for_project(db, project)
 
     token = uuid.uuid4().hex
     expires_at = datetime.utcnow() + timedelta(days=payload.expiresInDays)
