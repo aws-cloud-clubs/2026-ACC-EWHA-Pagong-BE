@@ -122,14 +122,28 @@ def get_public_base_url(request: Optional[Request] = None) -> str:
     return "http://127.0.0.1:8000"
 
 
-def build_content_disposition(filename: str) -> str:
-    """RFC 5987 filename* 인코딩으로 한글 파일명 다운로드 지원."""
+def should_inline_in_browser(mime_type: Optional[str], filename: str) -> bool:
+    if mime_type:
+        if mime_type.startswith("image/"):
+            return True
+        if mime_type in {"application/pdf", "text/plain", "text/html"}:
+            return True
+        if mime_type.startswith("text/"):
+            return True
+
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".txt", ".html"}
+
+
+def build_content_disposition(filename: str, *, inline: bool = False) -> str:
+    """RFC 5987 filename* 인코딩으로 한글 파일명 지원."""
+    disposition = "inline" if inline else "attachment"
     ascii_fallback = "".join(
         ch if ch.isascii() and ch not in {'"', "\\"} else "_"
         for ch in filename
     ).strip() or "download"
     encoded = quote(filename, safe="")
-    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
+    return f'{disposition}; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
 
 
 def generate_presigned_download_url(
@@ -139,6 +153,7 @@ def generate_presigned_download_url(
     original_filename: str,
     mime_type: Optional[str] = None,
     expires_in: Optional[int] = None,
+    inline: bool = False,
 ) -> str:
     if s3_client is None:
         raise HTTPException(status_code=500, detail="S3 클라이언트가 초기화되지 않았습니다.")
@@ -146,7 +161,10 @@ def generate_presigned_download_url(
     params = {
         "Bucket": bucket,
         "Key": key,
-        "ResponseContentDisposition": build_content_disposition(original_filename),
+        "ResponseContentDisposition": build_content_disposition(
+            original_filename,
+            inline=inline,
+        ),
     }
     if mime_type:
         params["ResponseContentType"] = mime_type
@@ -188,17 +206,22 @@ def generate_presigned_upload_url(
         raise HTTPException(status_code=500, detail="S3 presigned 업로드 URL 생성에 실패했습니다.")
 
 
-def build_presigned_download_for_file(file_record: "StoredFile") -> str:
+def build_presigned_download_for_file(file_record: "StoredFile", *, inline: bool = False) -> str:
     if not file_record.storage_path.startswith("s3://"):
         raise HTTPException(status_code=500, detail="S3 파일만 presigned URL을 사용할 수 있습니다.")
 
     bucket, key = _parse_s3_storage_path(file_record.storage_path)
     ensure_file_exists(file_record.storage_path)
+    display_inline = inline or should_inline_in_browser(
+        file_record.mime_type,
+        file_record.original_filename,
+    )
     return generate_presigned_download_url(
         bucket,
         key,
         original_filename=file_record.original_filename,
         mime_type=file_record.mime_type,
+        inline=display_inline,
     )
 
 
@@ -248,7 +271,13 @@ def ensure_file_exists(storage_path: str) -> None:
         raise HTTPException(status_code=404, detail="저장된 파일을 찾을 수 없습니다.")
 
 
-def build_download_response(file_record: "StoredFile"):
+def build_download_response(file_record: "StoredFile", *, inline: bool = False):
+    display_inline = inline or should_inline_in_browser(
+        file_record.mime_type,
+        file_record.original_filename,
+    )
+    disposition = "inline" if display_inline else "attachment"
+
     if file_record.storage_path.startswith("s3://"):
         if s3_client is None:
             raise HTTPException(status_code=500, detail="S3 클라이언트가 초기화되지 않았습니다.")
@@ -261,8 +290,12 @@ def build_download_response(file_record: "StoredFile"):
         except BotoCoreError:
             raise HTTPException(status_code=500, detail="S3 파일 다운로드에 실패했습니다.")
 
-        filename = file_record.original_filename.replace('"', "")
-        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers = {
+            "Content-Disposition": build_content_disposition(
+                file_record.original_filename,
+                inline=display_inline,
+            )
+        }
         return StreamingResponse(
             BytesIO(body),
             media_type=file_record.mime_type or "application/octet-stream",
@@ -272,7 +305,8 @@ def build_download_response(file_record: "StoredFile"):
     return FileResponse(
         path=file_record.storage_path,
         filename=file_record.original_filename,
-        media_type=file_record.mime_type
+        media_type=file_record.mime_type,
+        content_disposition_type=disposition,
     )
 
 
@@ -1315,14 +1349,17 @@ def create_share_link(
     db.commit()
     db.refresh(share_link)
 
-    share_url = f"{get_public_base_url(request)}/api/share-links/{share_link.token}"
+    base_url = get_public_base_url(request)
+    share_download_url = f"{base_url}/api/share-links/{share_link.token}/download"
+    share_info_url = f"{base_url}/api/share-links/{share_link.token}"
 
     return {
         "shareLinkId": share_link.id,
         "fileId": share_link.file_id,
         "projectId": file_record.project_id,
         "token": share_link.token,
-        "url": share_url,
+        "url": share_download_url,
+        "infoUrl": share_info_url,
         "clientId": share_link.client_id,
         "clientName": share_link.client_name,
         "createdBy": share_link.created_by,
@@ -1394,17 +1431,19 @@ def download_share_link_file(
     )
 
     if USE_S3 and file_record.storage_path.startswith("s3://"):
-        download_url = build_presigned_download_for_file(file_record)
+        download_url = build_presigned_download_for_file(file_record, inline=True)
         if response_format == "json":
             return {
                 "downloadUrl": download_url,
+                "viewUrl": download_url,
                 "expiresIn": PRESIGNED_URL_EXPIRES_IN,
                 "originalFilename": file_record.original_filename,
+                "mimeType": file_record.mime_type,
             }
         return RedirectResponse(url=download_url, status_code=307)
 
     ensure_file_exists(file_record.storage_path)
-    return build_download_response(file_record)
+    return build_download_response(file_record, inline=True)
 
 
 @app.get("/api/projects/{project_id}/files")
