@@ -969,6 +969,36 @@ def get_clients(
     }
 
 
+@app.get("/api/users")
+def get_users(
+    role: Optional[Literal["EMPLOYEE", "MANAGER", "EXECUTIVE"]] = Query(
+        default=None,
+        description="역할 필터. 없으면 전체 사용자 목록을 반환합니다.",
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_manager_or_executive(current_user)
+
+    query = db.query(User).order_by(User.id.asc())
+    if role:
+        query = query.filter(User.role == role)
+
+    users = query.all()
+
+    return {
+        "users": [
+            {
+                "userId": user.id,
+                "name": user.name,
+                "email": user.email,
+                "role": user.role,
+            }
+            for user in users
+        ]
+    }
+
+
 @app.post("/api/projects", status_code=201)
 def create_project(
     payload: ProjectCreateRequest,
