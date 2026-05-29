@@ -3,7 +3,7 @@ import uuid
 import shutil
 from io import BytesIO
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Literal
 from urllib.parse import quote
 
@@ -564,8 +564,18 @@ def get_db():
         db.close()
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def create_access_token(user: User) -> str:
-    now = datetime.utcnow()
+    now = utc_now()
     payload = {
         "sub": str(user.id),
         "role": user.role,
@@ -758,11 +768,11 @@ def get_active_share_link(db: Session, token: str) -> ShareLink:
     if share_link.status == "REVOKED":
         raise HTTPException(status_code=410, detail="비활성화된 공유 링크입니다.")
 
-    now = datetime.utcnow()
-    if share_link.expires_at < now:
+    now = utc_now()
+    if as_utc(share_link.expires_at) < now:
         if share_link.status != "EXPIRED":
             share_link.status = "EXPIRED"
-            share_link.updated_at = now
+            share_link.updated_at = now.replace(tzinfo=None)
             db.commit()
         raise HTTPException(status_code=410, detail="만료된 공유 링크입니다.")
 
@@ -1290,7 +1300,7 @@ def create_share_link(
     client = get_client_for_project(db, project)
 
     token = uuid.uuid4().hex
-    expires_at = datetime.utcnow() + timedelta(days=payload.expiresInDays)
+    expires_at = utc_now() + timedelta(days=payload.expiresInDays)
     share_link = ShareLink(
         file_id=file_id,
         token=token,
