@@ -848,6 +848,47 @@ def get_active_share_link(db: Session, token: str) -> ShareLink:
     return share_link
 
 
+def refresh_share_link_status(db: Session, share_link: ShareLink) -> str:
+    if share_link.status == "REVOKED":
+        return share_link.status
+
+    now = utc_now()
+    if as_utc(share_link.expires_at) < now:
+        if share_link.status != "EXPIRED":
+            share_link.status = "EXPIRED"
+            share_link.updated_at = now.replace(tzinfo=None)
+        return "EXPIRED"
+
+    return share_link.status
+
+
+def serialize_share_link(
+    share_link: ShareLink,
+    file_record: StoredFile,
+    base_url: str,
+) -> dict:
+    share_download_url = f"{base_url}/api/share-links/{share_link.token}/download"
+    share_info_url = f"{base_url}/api/share-links/{share_link.token}"
+
+    return {
+        "shareLinkId": share_link.id,
+        "fileId": share_link.file_id,
+        "projectId": file_record.project_id,
+        "token": share_link.token,
+        "url": share_download_url,
+        "infoUrl": share_info_url,
+        "originalFilename": file_record.original_filename,
+        "fileType": file_record.file_type,
+        "clientId": share_link.client_id,
+        "clientName": share_link.client_name,
+        "createdBy": share_link.created_by,
+        "creatorName": share_link.creator.name if share_link.creator else None,
+        "expiresAt": share_link.expires_at,
+        "status": share_link.status,
+        "createdAt": share_link.created_at,
+    }
+
+
 def startup():
     if APP_ENV == "production" and JWT_SECRET_KEY == "dev-secret-change-this":
         raise RuntimeError("JWT_SECRET_KEY must be set in production.")
@@ -1415,21 +1456,81 @@ def create_share_link(
     db.refresh(share_link)
 
     base_url = get_public_base_url(request)
-    share_download_url = f"{base_url}/api/share-links/{share_link.token}/download"
-    share_info_url = f"{base_url}/api/share-links/{share_link.token}"
+    return serialize_share_link(share_link, file_record, base_url)
+
+
+@app.get("/api/share-links")
+def list_share_links(
+    request: Request,
+    projectId: Optional[int] = Query(
+        default=None,
+        description="프로젝트 ID로 필터링합니다.",
+    ),
+    fileId: Optional[int] = Query(
+        default=None,
+        description="파일 ID로 필터링합니다.",
+    ),
+    status: Optional[Literal["ACTIVE", "EXPIRED", "REVOKED"]] = Query(
+        default=None,
+        description="링크 상태로 필터링합니다.",
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_manager_or_executive(current_user)
+
+    memberships = db.query(ProjectMember).filter(
+        ProjectMember.user_id == current_user.id
+    ).all()
+    accessible_project_ids = {membership.project_id for membership in memberships}
+
+    if not accessible_project_ids:
+        return {"shareLinks": [], "totalCount": 0}
+
+    if projectId is not None:
+        if projectId not in accessible_project_ids:
+            raise HTTPException(status_code=403, detail="프로젝트 접근 권한이 없습니다.")
+        accessible_project_ids = {projectId}
+
+    query = (
+        db.query(ShareLink)
+        .join(StoredFile, ShareLink.file_id == StoredFile.id)
+        .filter(
+            StoredFile.status == "ACTIVE",
+            StoredFile.project_id.in_(accessible_project_ids),
+        )
+    )
+
+    if fileId is not None:
+        query = query.filter(ShareLink.file_id == fileId)
+
+    share_links = query.order_by(ShareLink.created_at.desc()).all()
+
+    base_url = get_public_base_url(request)
+    serialized: List[dict] = []
+    status_updated = False
+
+    for share_link in share_links:
+        file_record = share_link.file
+        if not file_record:
+            continue
+
+        previous_status = share_link.status
+        current_status = refresh_share_link_status(db, share_link)
+        if share_link.status != previous_status:
+            status_updated = True
+
+        if status and current_status != status:
+            continue
+
+        serialized.append(serialize_share_link(share_link, file_record, base_url))
+
+    if status_updated:
+        db.commit()
 
     return {
-        "shareLinkId": share_link.id,
-        "fileId": share_link.file_id,
-        "projectId": file_record.project_id,
-        "token": share_link.token,
-        "url": share_download_url,
-        "infoUrl": share_info_url,
-        "clientId": share_link.client_id,
-        "clientName": share_link.client_name,
-        "createdBy": share_link.created_by,
-        "expiresAt": share_link.expires_at,
-        "status": share_link.status
+        "shareLinks": serialized,
+        "totalCount": len(serialized),
     }
 
 
