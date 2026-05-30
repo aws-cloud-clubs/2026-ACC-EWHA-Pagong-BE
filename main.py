@@ -929,7 +929,7 @@ def serialize_share_link(
     return {
         "shareLinkId": share_link.id,
         "fileId": share_link.file_id,
-        "projectId": file_record.project_id,
+        "projectName": file_record.project.name if file_record.project else None,
         "token": share_link.token,
         "url": share_download_url,
         "infoUrl": share_info_url,
