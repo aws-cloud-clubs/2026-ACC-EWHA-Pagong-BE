@@ -1,5 +1,14 @@
 # FE API Notes
 
+**Production API base URL:** `https://api.pagong.dev`  
+(Vercel: `NEXT_PUBLIC_API_URL=https://api.pagong.dev` — `http://52.78.185.67:8000` 사용 금지)
+
+## 공유 링크 목록
+
+`GET /api/share-links` (MANAGER / EXECUTIVE, Bearer 토큰)
+
+선택 쿼리: `projectId`, `fileId`, `status`
+
 ## 공유 링크 생성
 
 `POST /api/files/{file_id}/share-links`
@@ -32,7 +41,8 @@ FE가 보내지 않는 값:
   "fileId": 3,
   "projectId": 2,
   "token": "generated-token",
-  "url": "http://server/api/share-links/generated-token",
+  "url": "https://api.pagong.dev/api/share-links/generated-token/download",
+  "infoUrl": "https://api.pagong.dev/api/share-links/generated-token",
   "clientId": 1,
   "clientName": "A뷰티",
   "createdBy": 2,
