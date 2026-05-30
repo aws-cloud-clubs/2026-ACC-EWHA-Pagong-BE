@@ -625,7 +625,7 @@ class ShareLinkCreateRequest(BaseModel):
     )
     assignedStaffUserId: Optional[int] = Field(
         default=None,
-        description="담당 사원 ID. 지정하면 해당 사원도 GET /api/share-links에서 조회할 수 있습니다.",
+        description="담당 사원 ID. 선택값이며, 해당 프로젝트의 EMPLOYEE 멤버여야 합니다.",
         examples=[1],
     )
 
@@ -1549,9 +1549,6 @@ def list_share_links(
             StoredFile.project_id.in_(accessible_project_ids),
         )
     )
-
-    if current_user.role == "EMPLOYEE":
-        query = query.filter(ShareLink.assigned_staff_user_id == current_user.id)
 
     if fileId is not None:
         query = query.filter(ShareLink.file_id == fileId)
